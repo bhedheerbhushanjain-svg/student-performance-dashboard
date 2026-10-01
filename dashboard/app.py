@@ -436,6 +436,15 @@ with tab_stats:
         use_container_width=True
     )
 
+    stats_csv = numeric_summary.to_csv().encode("utf-8")
+    st.download_button(
+        label="📥 Download Statistical Summary as CSV",
+        data=stats_csv,
+        file_name="statistical_summary_metrics.csv",
+        mime="text/csv",
+        key="btn_download_stats"
+    )
+
     st.markdown("---")
     st.subheader("Correlation Analysis")
 
