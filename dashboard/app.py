@@ -29,7 +29,12 @@ from src.data_loader import (
 )
 from src.preprocessing import (
     LABEL_MAPPINGS,
-    add_readable_labels
+    add_readable_labels,
+    handle_missing_values,
+    BINARY_COLUMNS,
+    NOMINAL_COLUMNS,
+    GRADE_COLUMNS,
+    TARGET_COLUMN
 )
 from src.analysis import (
     compute_summary_statistics,
@@ -97,15 +102,15 @@ st.markdown("""
 @st.cache_data(show_spinner=False)
 def get_cached_dataset(dataset_choice: str) -> pd.DataFrame:
     """Load and cache the selected dataset."""
-    if dataset_choice == "Mathematics (student-mat.csv)":
-        return load_raw_data("mat")
-    elif dataset_choice == "Portuguese (student-por.csv)":
-        return load_raw_data("por")
-    elif dataset_choice == "Combined Dataset (Both Subjects)":
+    if "All Students" in dataset_choice or "Combined" in dataset_choice:
         return load_both_courses()
-    elif dataset_choice == "Matched Cohort (Overlapping Students)":
+    elif "Mathematics" in dataset_choice:
+        return load_raw_data("mat")
+    elif "Portuguese" in dataset_choice:
+        return load_raw_data("por")
+    elif "Matched" in dataset_choice:
         return _normalise_merged_cohort(load_merged_cohort())
-    return load_raw_data("mat")
+    return load_both_courses()
 
 
 def _normalise_merged_cohort(merged: pd.DataFrame) -> pd.DataFrame:
@@ -161,10 +166,10 @@ st.sidebar.subheader("📁 Dataset Selection")
 dataset_choice = st.sidebar.selectbox(
     "Select Academic Cohort:",
     [
-        "Mathematics (student-mat.csv)",
-        "Portuguese (student-por.csv)",
-        "Combined Dataset (Both Subjects)",
-        "Matched Cohort (Overlapping Students)"
+        "All Students (Combined Dataset - 1,044 Records)",
+        "Mathematics Cohort (student-mat.csv - 395 Records)",
+        "Portuguese Cohort (student-por.csv - 649 Records)",
+        "Matched Cohort (Overlapping Students - 382 Records)"
     ],
     index=0
 )
@@ -426,6 +431,84 @@ with tab_data:
         mime="text/csv"
     )
 
+    st.markdown("---")
+    st.subheader("👤 Individual Student Profile Inspector")
+    st.write("Inspect any individual student record from the active cohort and compare their metrics to class-wide averages:")
+
+    indexed_students = filtered_df.reset_index(drop=True)
+    stu_labels = [
+        f"Student #{i+1} | {row['school']} | {LABEL_MAPPINGS['sex'].get(row['sex'], row['sex'])} | Age {row['age']} | Final Grade: {row['G3']}/20"
+        for i, row in indexed_students.iterrows()
+    ]
+    selected_stu_idx = st.selectbox(
+        "Select Student to Inspect:",
+        range(len(stu_labels)),
+        format_func=lambda idx: stu_labels[idx],
+        key="sb_inspect_student"
+    )
+    sel_student = indexed_students.iloc[selected_stu_idx]
+
+    c_s1, c_s2, c_s3, c_s4 = st.columns(4)
+    c_s1.metric(
+        "Final Grade (G3)",
+        f"{sel_student['G3']} / 20",
+        f"{sel_student['G3'] - mean_g3:+.2f} vs Cohort Mean ({mean_g3:.1f})"
+    )
+    grade_trend = (
+        "📈 Rising" if sel_student['G3'] > sel_student['G1']
+        else "📉 Declining" if sel_student['G3'] < sel_student['G1']
+        else "➖ Consistent"
+    )
+    c_s2.metric(
+        "Term Trajectory",
+        f"G1: {sel_student['G1']} → G2: {sel_student['G2']}",
+        grade_trend
+    )
+    c_s3.metric(
+        "Absences",
+        f"{sel_student['absences']} days",
+        f"{sel_student['absences'] - float(filtered_df['absences'].mean()):+.1f} vs Cohort Mean"
+    )
+    c_s4.metric(
+        "Academic Status",
+        "✅ Passing" if sel_student['G3'] >= 10 else "⚠️ Needs Support",
+        f"Past Failures: {sel_student['failures']}"
+    )
+
+    with st.expander(f"📋 Full Background Dossier: Student #{selected_stu_idx+1}", expanded=False):
+        d_col1, d_col2, d_col3 = st.columns(3)
+        with d_col1:
+            st.markdown(f"""
+            **Demographics & Environment:**
+            - **School:** {sel_student['school']} ({LABEL_MAPPINGS['school'].get(sel_student['school'], sel_student['school'])})
+            - **Gender:** {LABEL_MAPPINGS['sex'].get(sel_student['sex'], sel_student['sex'])}
+            - **Age:** {sel_student['age']}
+            - **Area:** {LABEL_MAPPINGS['address'].get(sel_student['address'], sel_student['address'])}
+            - **Family Size:** {LABEL_MAPPINGS['famsize'].get(sel_student['famsize'], sel_student['famsize'])}
+            - **Parents Cohabitation:** {LABEL_MAPPINGS['Pstatus'].get(sel_student['Pstatus'], sel_student['Pstatus'])}
+            """)
+        with d_col2:
+            st.markdown(f"""
+            **Academic Habits & Support:**
+            - **Study Time:** {LABEL_MAPPINGS['studytime'].get(sel_student['studytime'], str(sel_student['studytime']))}
+            - **Past Failures:** {sel_student['failures']}
+            - **School Extra Support:** {str(sel_student['schoolsup']).title()}
+            - **Family Educational Support:** {str(sel_student['famsup']).title()}
+            - **Paid Extra Classes:** {str(sel_student['paid']).title()}
+            - **Higher Education Ambition:** {str(sel_student['higher']).title()}
+            """)
+        with d_col3:
+            st.markdown(f"""
+            **Home Life & Lifestyle:**
+            - **Mother's Education:** {LABEL_MAPPINGS['Medu'].get(sel_student['Medu'], str(sel_student['Medu']))}
+            - **Father's Education:** {LABEL_MAPPINGS['Fedu'].get(sel_student['Fedu'], str(sel_student['Fedu']))}
+            - **Home Internet Access:** {str(sel_student['internet']).title()}
+            - **In Relationship:** {str(sel_student['romantic']).title()}
+            - **Free Time / Socializing:** {sel_student['freetime']}/5 | {sel_student['goout']}/5
+            - **Health Rating:** {sel_student['health']}/5
+            """)
+
+
 # ------------------------------------------
 # TAB 3: PERFORMANCE VISUALIZATIONS
 # ------------------------------------------
@@ -545,81 +628,169 @@ with tab_ml:
             )
 
         st.markdown("---")
-        st.subheader("🎯 Interactive Early Warning Predictor (Regime B - Clean)")
-        st.write("Test the trained Random Forest Early Warning model on custom student profiles:")
-
-        pred_col1, pred_col2, pred_col3, pred_col4 = st.columns(4)
-        with pred_col1:
-            input_school = st.selectbox("School", ["GP", "MS"], key="pred_school")
-            input_sex = st.selectbox("Sex", ["F", "M"], key="pred_sex")
-            input_age = st.slider("Age", 15, 22, 16, key="pred_age")
-        with pred_col2:
-            input_study = st.selectbox("Study Time", [1, 2, 3, 4], format_func=lambda x: LABEL_MAPPINGS["studytime"][x], key="pred_study")
-            input_failures = st.selectbox("Past Failures", [0, 1, 2, 3], key="pred_fail")
-            input_absences = st.slider("Absences", 0, 50, 4, key="pred_abs")
-        with pred_col3:
-            input_medu = st.selectbox("Mother Education", [0, 1, 2, 3, 4], format_func=lambda x: LABEL_MAPPINGS["Medu"][x], key="pred_medu")
-            input_fedu = st.selectbox("Father Education", [0, 1, 2, 3, 4], format_func=lambda x: LABEL_MAPPINGS["Fedu"][x], key="pred_fedu")
-            input_internet = st.selectbox("Internet Access", ["yes", "no"], key="pred_net")
-        with pred_col4:
-            input_higher = st.selectbox("Aims for Higher Ed", ["yes", "no"], key="pred_high")
-            input_romantic = st.selectbox("In Relationship", ["yes", "no"], key="pred_rom")
-            input_freetime = st.slider("Free Time (1-5)", 1, 5, 3, key="pred_free")
-
-        # Synthesize sample input matching feature names
-        clean_model = ml_results["clean"]["Random Forest"]["model"]
-        sample_dict = {
-            "age": input_age,
-            "Medu": input_medu,
-            "Fedu": input_fedu,
-            "traveltime": 1,
-            "studytime": input_study,
-            "failures": input_failures,
-            "schoolsup": 0,
-            "famsup": 1,
-            "paid": 0,
-            "activities": 1,
-            "nursery": 1,
-            "higher": 1 if input_higher == "yes" else 0,
-            "internet": 1 if input_internet == "yes" else 0,
-            "romantic": 1 if input_romantic == "yes" else 0,
-            "famrel": 4,
-            "freetime": input_freetime,
-            "goout": 3,
-            "Dalc": 1,
-            "Walc": 2,
-            "health": 4,
-            "absences": input_absences,
-            "school_MS": 1 if input_school == "MS" else 0,
-            "sex_M": 1 if input_sex == "M" else 0,
-            "address_U": 1,
-            "famsize_LE3": 0,
-            "Pstatus_T": 1,
-            "Mjob_health": 0,
-            "Mjob_other": 1,
-            "Mjob_services": 0,
-            "Mjob_teacher": 0,
-            "Fjob_health": 0,
-            "Fjob_other": 1,
-            "Fjob_services": 0,
-            "Fjob_teacher": 0,
-            "reason_home": 0,
-            "reason_other": 0,
-            "reason_reputation": 1,
-            "guardian_mother": 1,
-            "guardian_other": 0
-        }
-
-        # Align features
-        feature_names = ml_results["clean"]["feature_importance"]["feature"].tolist()
-        aligned_values = [sample_dict.get(fn, 0) for fn in feature_names]
-        input_array = np.array(aligned_values).reshape(1, -1)
-
-        predicted_grade = float(clean_model.predict(input_array)[0])
-        st.success(
-            f"🎯 **Predicted Final Grade (G3):** `{predicted_grade:.2f} / 20` "
-            f"({'✅ Passing' if predicted_grade >= 10 else '⚠️ Academic Risk - Intervention Advised'})"
+        st.subheader(f"👥 Cohort-Wide Early Warning Risk Assessment (Evaluated Across ALL {len(filtered_df):,} Students)")
+        st.write(
+            "Using the trained **Regime B Clean Model (Zero Data Leakage)**, each student's final performance is "
+            "forecasted solely from pre-enrollment variables (study habits, past failures, attendance, and demographics)."
         )
+
+        # Batch prediction across all active students
+        clean_model = ml_results["clean"]["Random Forest"]["model"]
+        trained_features = list(clean_model.feature_names_in_)
+
+        df_eval = handle_missing_values(filtered_df.copy())
+        drop_eval_cols = [TARGET_COLUMN, "subject"] + [f"label_{c}" for c in LABEL_MAPPINGS.keys()] + GRADE_COLUMNS
+        X_eval_raw = df_eval.drop(columns=[c for c in drop_eval_cols if c in df_eval.columns])
+        for col in BINARY_COLUMNS:
+            if col in X_eval_raw.columns:
+                X_eval_raw[col] = (X_eval_raw[col].astype(str).str.lower() == "yes").astype(int)
+        nom_cols = [c for c in NOMINAL_COLUMNS if c in X_eval_raw.columns]
+        X_eval_encoded = pd.get_dummies(X_eval_raw, columns=nom_cols, drop_first=True, dtype=float)
+        X_eval_aligned = X_eval_encoded.reindex(columns=trained_features, fill_value=0.0)
+
+        all_pred_grades = clean_model.predict(X_eval_aligned)
+        all_pred_grades = np.clip(np.round(all_pred_grades, 2), 0.0, 20.0)
+
+        subject_series = filtered_df["subject"] if "subject" in filtered_df.columns else pd.Series(["Core"] * len(filtered_df))
+
+        predictions_df = pd.DataFrame({
+            "Student ID": [f"STU_{i+1:04d}" for i in range(len(filtered_df))],
+            "Subject": subject_series.values,
+            "School": filtered_df["school"].values,
+            "Gender": [LABEL_MAPPINGS["sex"].get(s, s) for s in filtered_df["sex"].values],
+            "Age": filtered_df["age"].values,
+            "Study Time": filtered_df["studytime"].map(LABEL_MAPPINGS["studytime"]).values,
+            "Failures": filtered_df["failures"].values,
+            "Absences": filtered_df["absences"].values,
+            "Actual G3": filtered_df["G3"].values,
+            "Predicted G3": all_pred_grades,
+            "Error (Actual - Pred)": np.round(filtered_df["G3"].values - all_pred_grades, 2)
+        })
+
+        def _classify_risk_tier(row):
+            pred = row["Predicted G3"]
+            fail = row["Failures"]
+            if pred < 10.0 or fail >= 2:
+                return "🔴 High Academic Risk"
+            elif pred < 11.5 or fail == 1:
+                return "🟡 Moderate Watch"
+            else:
+                return "🟢 On Track / Low Risk"
+
+        predictions_df["Early Warning Tier"] = predictions_df.apply(_classify_risk_tier, axis=1)
+
+        high_risk_n = int((predictions_df["Early Warning Tier"] == "🔴 High Academic Risk").sum())
+        mod_risk_n  = int((predictions_df["Early Warning Tier"] == "🟡 Moderate Watch").sum())
+        safe_n      = int((predictions_df["Early Warning Tier"] == "🟢 On Track / Low Risk").sum())
+
+        kpi_r1, kpi_r2, kpi_r3, kpi_r4 = st.columns(4)
+        kpi_r1.metric("Students Assessed", f"{len(predictions_df):,}", "100% of Active Cohort")
+        kpi_r2.metric("🔴 High Risk Flagged", f"{high_risk_n:,}", f"{high_risk_n/len(predictions_df)*100:.1f}% need intervention")
+        kpi_r3.metric("🟡 Moderate Watch", f"{mod_risk_n:,}", f"{mod_risk_n/len(predictions_df)*100:.1f}% borderline")
+        kpi_r4.metric("🟢 On Track (Safe)", f"{safe_n:,}", f"{safe_n/len(predictions_df)*100:.1f}% predicted passing")
+
+        filter_col_a, filter_col_b = st.columns([2, 2])
+        with filter_col_a:
+            selected_tier = st.selectbox(
+                "Filter All Students by Early-Warning Status:",
+                ["All Students", "🔴 High Academic Risk", "🟡 Moderate Watch", "🟢 On Track / Low Risk"]
+            )
+        with filter_col_b:
+            stu_query = st.text_input("🔍 Search Student ID (e.g. STU_0012) or Subject / School:", "")
+
+        view_df = predictions_df.copy()
+        if selected_tier != "All Students":
+            view_df = view_df[view_df["Early Warning Tier"] == selected_tier]
+        if stu_query:
+            query_mask = view_df.astype(str).apply(lambda r: r.str.contains(stu_query, case=False).any(), axis=1)
+            view_df = view_df[query_mask]
+
+        st.write(f"Displaying **{len(view_df):,}** students:")
+        st.dataframe(
+            view_df.style.background_gradient(subset=["Predicted G3", "Actual G3"], cmap="Blues"),
+            use_container_width=True,
+            height=380
+        )
+
+        all_preds_csv = view_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            label=f"📥 Download Risk Assessment for All {len(view_df):,} Students (CSV)",
+            data=all_preds_csv,
+            file_name="cohort_student_early_warning_predictions.csv",
+            mime="text/csv",
+            key="btn_dl_all_preds"
+        )
+
+        st.markdown("---")
+        with st.expander("🎯 Simulate Single Hypothetical Student Profile (What-If Sandbox)", expanded=False):
+            st.write("Adjust parameters to test individual hypothetical student scenarios against the Regime B model:")
+            pred_col1, pred_col2, pred_col3, pred_col4 = st.columns(4)
+            with pred_col1:
+                input_school = st.selectbox("School", ["GP", "MS"], key="pred_school")
+                input_sex = st.selectbox("Sex", ["F", "M"], key="pred_sex")
+                input_age = st.slider("Age", 15, 22, 16, key="pred_age")
+            with pred_col2:
+                input_study = st.selectbox("Study Time", [1, 2, 3, 4], format_func=lambda x: LABEL_MAPPINGS["studytime"][x], key="pred_study")
+                input_failures = st.selectbox("Past Failures", [0, 1, 2, 3], key="pred_fail")
+                input_absences = st.slider("Absences", 0, 50, 4, key="pred_abs")
+            with pred_col3:
+                input_medu = st.selectbox("Mother Education", [0, 1, 2, 3, 4], format_func=lambda x: LABEL_MAPPINGS["Medu"][x], key="pred_medu")
+                input_fedu = st.selectbox("Father Education", [0, 1, 2, 3, 4], format_func=lambda x: LABEL_MAPPINGS["Fedu"][x], key="pred_fedu")
+                input_internet = st.selectbox("Internet Access", ["yes", "no"], key="pred_net")
+            with pred_col4:
+                input_higher = st.selectbox("Aims for Higher Ed", ["yes", "no"], key="pred_high")
+                input_romantic = st.selectbox("In Relationship", ["yes", "no"], key="pred_rom")
+                input_freetime = st.slider("Free Time (1-5)", 1, 5, 3, key="pred_free")
+
+            sample_dict = {
+                "age": input_age,
+                "Medu": input_medu,
+                "Fedu": input_fedu,
+                "traveltime": 1,
+                "studytime": input_study,
+                "failures": input_failures,
+                "schoolsup": 0,
+                "famsup": 1,
+                "paid": 0,
+                "activities": 1,
+                "nursery": 1,
+                "higher": 1 if input_higher == "yes" else 0,
+                "internet": 1 if input_internet == "yes" else 0,
+                "romantic": 1 if input_romantic == "yes" else 0,
+                "famrel": 4,
+                "freetime": input_freetime,
+                "goout": 3,
+                "Dalc": 1,
+                "Walc": 2,
+                "health": 4,
+                "absences": input_absences,
+                "school_MS": 1 if input_school == "MS" else 0,
+                "sex_M": 1 if input_sex == "M" else 0,
+                "address_U": 1,
+                "famsize_LE3": 0,
+                "Pstatus_T": 1,
+                "Mjob_health": 0,
+                "Mjob_other": 1,
+                "Mjob_services": 0,
+                "Mjob_teacher": 0,
+                "Fjob_health": 0,
+                "Fjob_other": 1,
+                "Fjob_services": 0,
+                "Fjob_teacher": 0,
+                "reason_home": 0,
+                "reason_other": 0,
+                "reason_reputation": 1,
+                "guardian_mother": 1,
+                "guardian_other": 0
+            }
+
+            aligned_values = [sample_dict.get(fn, 0) for fn in trained_features]
+            input_array = np.array(aligned_values).reshape(1, -1)
+            sim_pred_grade = float(clean_model.predict(input_array)[0])
+            st.success(
+                f"🎯 **Simulated Student Predicted Grade (G3):** `{sim_pred_grade:.2f} / 20` "
+                f"({'✅ Passing / Low Risk' if sim_pred_grade >= 10 else '⚠️ High Academic Risk - Early Intervention Advised'})"
+            )
 
 # ------------------------------------------
 # TAB 6: AUTOMATED DATA-DRIVEN INSIGHTS
