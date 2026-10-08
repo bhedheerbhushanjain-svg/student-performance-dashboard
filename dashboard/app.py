@@ -154,6 +154,81 @@ def get_cached_ml_results(cache_key: str, _df: pd.DataFrame):
     return compare_leakage_regimes(_df, random_state=42)
 
 
+@st.cache_data(show_spinner=False)
+def get_cached_eda_figures(cache_key: str, _df: pd.DataFrame):
+    """Precompute and cache all 10 EDA Plotly figures for instantaneous tab rendering."""
+    return {
+        "grade_dist": plot_grade_distribution(_df),
+        "study_time": plot_study_time_vs_grade(_df),
+        "absences": plot_absences_vs_grade(_df),
+        "failures": plot_failures_vs_grade(_df),
+        "gender": plot_gender_performance(_df),
+        "school": plot_school_comparison(_df),
+        "age": plot_age_distribution(_df),
+        "parent_edu": plot_parental_education(_df),
+        "internet": plot_internet_access(_df),
+        "leakage": plot_grade_leakage_relationship(_df)
+    }
+
+
+@st.cache_data(show_spinner=False)
+def get_cached_stats_and_corrs(cache_key: str, _df: pd.DataFrame):
+    """Cache summary statistics and correlation heatmap computation."""
+    numeric_summary = compute_full_numeric_summary(_df)
+    corr_matrix, target_corr = compute_correlations(_df, "G3")
+    heatmap_fig = plot_correlation_heatmap(_df)
+    return numeric_summary, corr_matrix, target_corr, heatmap_fig
+
+
+@st.cache_data(show_spinner=False)
+def get_cached_batch_predictions(cache_key: str, _df: pd.DataFrame, _clean_model, trained_features: tuple):
+    """Cache batch predictions and vectorized risk tier classification across all students."""
+    df_eval = handle_missing_values(_df.copy())
+    drop_eval_cols = [TARGET_COLUMN, "subject"] + [f"label_{c}" for c in LABEL_MAPPINGS.keys()] + GRADE_COLUMNS
+    X_eval_raw = df_eval.drop(columns=[c for c in drop_eval_cols if c in df_eval.columns])
+    for col in BINARY_COLUMNS:
+        if col in X_eval_raw.columns:
+            X_eval_raw[col] = (X_eval_raw[col].astype(str).str.lower() == "yes").astype(int)
+    nom_cols = [c for c in NOMINAL_COLUMNS if c in X_eval_raw.columns]
+    X_eval_encoded = pd.get_dummies(X_eval_raw, columns=nom_cols, drop_first=True, dtype=float)
+    X_eval_aligned = X_eval_encoded.reindex(columns=list(trained_features), fill_value=0.0)
+
+    all_pred_grades = _clean_model.predict(X_eval_aligned)
+    all_pred_grades = np.clip(np.round(all_pred_grades, 2), 0.0, 20.0)
+
+    fails = _df["failures"].values
+    condlist = [
+        (all_pred_grades < 10.0) | (fails >= 2),
+        (all_pred_grades < 11.5) | (fails == 1)
+    ]
+    choicelist = ["🔴 High Academic Risk", "🟡 Moderate Watch"]
+    tiers = np.select(condlist, choicelist, default="🟢 On Track / Low Risk")
+
+    subject_series = _df["subject"] if "subject" in _df.columns else pd.Series(["Core"] * len(_df))
+
+    return pd.DataFrame({
+        "Student ID": [f"STU_{i+1:04d}" for i in range(len(_df))],
+        "Subject": subject_series.values,
+        "School": _df["school"].values,
+        "Gender": [LABEL_MAPPINGS["sex"].get(s, s) for s in _df["sex"].values],
+        "Age": _df["age"].values,
+        "Study Time": _df["studytime"].map(LABEL_MAPPINGS["studytime"]).values,
+        "Failures": _df["failures"].values,
+        "Absences": _df["absences"].values,
+        "Actual G3": _df["G3"].values,
+        "Predicted G3": all_pred_grades,
+        "Error (Actual - Pred)": np.round(_df["G3"].values - all_pred_grades, 2),
+        "Early Warning Tier": tiers
+    })
+
+
+@st.cache_data(show_spinner=False)
+def get_cached_insights(cache_key: str, _df: pd.DataFrame):
+    """Cache dynamic mathematical observations."""
+    return generate_automated_insights(_df)
+
+
+
 # ==========================================
 # SIDEBAR CONTROLS
 # ==========================================
@@ -294,8 +369,9 @@ std_g3 = float(g3_col.std()) if len(g3_col) > 1 else 0.0
 pass_rate = float((g3_col >= 10).mean() * 100)
 zero_count = int((g3_col == 0).sum())
 
-# Stable cache key for ML results — shared by Tab 5 and Presentation tab
-ml_cache_key = f"{dataset_choice}|{len(filtered_df)}|{int(filtered_df['G3'].sum())}"
+# Stable cache key for all computations — shared across all dashboard tabs
+active_cache_key = f"{dataset_choice}|{len(filtered_df)}|{int(filtered_df['G3'].sum())}"
+ml_cache_key = active_cache_key
 
 col1, col2, col3, col4, col5 = st.columns(5)
 col1.metric("Total Records", f"{len(filtered_df):,}", f"{(len(filtered_df)/len(raw_df))*100:.1f}% of cohort")
@@ -516,40 +592,42 @@ with tab_eda:
     st.header("Exploratory Data Analysis")
     st.write("Interactive charts exploring distributions, lifestyle habits, and demographic influences.")
 
+    eda_figs = get_cached_eda_figures(active_cache_key, filtered_df)
+
     # Row 1: Grade Distribution & Study Time
     r1_col1, r1_col2 = st.columns(2)
     with r1_col1:
-        st.plotly_chart(plot_grade_distribution(filtered_df), use_container_width=True)
+        st.plotly_chart(eda_figs["grade_dist"], use_container_width=True)
     with r1_col2:
-        st.plotly_chart(plot_study_time_vs_grade(filtered_df), use_container_width=True)
+        st.plotly_chart(eda_figs["study_time"], use_container_width=True)
 
     # Row 2: Absences vs Grade & Failures vs Grade
     r2_col1, r2_col2 = st.columns(2)
     with r2_col1:
-        st.plotly_chart(plot_absences_vs_grade(filtered_df), use_container_width=True)
+        st.plotly_chart(eda_figs["absences"], use_container_width=True)
     with r2_col2:
-        st.plotly_chart(plot_failures_vs_grade(filtered_df), use_container_width=True)
+        st.plotly_chart(eda_figs["failures"], use_container_width=True)
 
     # Row 3: Gender & School Comparisons
     r3_col1, r3_col2 = st.columns(2)
     with r3_col1:
-        st.plotly_chart(plot_gender_performance(filtered_df), use_container_width=True)
+        st.plotly_chart(eda_figs["gender"], use_container_width=True)
     with r3_col2:
-        st.plotly_chart(plot_school_comparison(filtered_df), use_container_width=True)
+        st.plotly_chart(eda_figs["school"], use_container_width=True)
 
     # Row 4: Age Distribution & Parental Education
     r4_col1, r4_col2 = st.columns(2)
     with r4_col1:
-        st.plotly_chart(plot_age_distribution(filtered_df), use_container_width=True)
+        st.plotly_chart(eda_figs["age"], use_container_width=True)
     with r4_col2:
-        st.plotly_chart(plot_parental_education(filtered_df), use_container_width=True)
+        st.plotly_chart(eda_figs["parent_edu"], use_container_width=True)
 
     # Row 5: Internet Access & G1/G2/G3 Collinearity
     r5_col1, r5_col2 = st.columns(2)
     with r5_col1:
-        st.plotly_chart(plot_internet_access(filtered_df), use_container_width=True)
+        st.plotly_chart(eda_figs["internet"], use_container_width=True)
     with r5_col2:
-        st.plotly_chart(plot_grade_leakage_relationship(filtered_df), use_container_width=True)
+        st.plotly_chart(eda_figs["leakage"], use_container_width=True)
 
 # ------------------------------------------
 # TAB 4: STATISTICAL DEEP-DIVE
@@ -558,7 +636,7 @@ with tab_stats:
     st.header("Comprehensive Statistical Summary")
     st.write("Parametric and non-parametric statistical metrics computed across all numeric attributes.")
 
-    numeric_summary = compute_full_numeric_summary(filtered_df)
+    numeric_summary, corr_matrix, target_corr, heatmap_fig = get_cached_stats_and_corrs(active_cache_key, filtered_df)
     st.dataframe(
         numeric_summary.style.format("{:.2f}").background_gradient(cmap="Blues", subset=["mean", "median"]),
         use_container_width=True
@@ -578,10 +656,9 @@ with tab_stats:
 
     corr_col1, corr_col2 = st.columns([3, 2])
     with corr_col1:
-        st.plotly_chart(plot_correlation_heatmap(filtered_df), use_container_width=True)
+        st.plotly_chart(heatmap_fig, use_container_width=True)
     with corr_col2:
         st.write("**Top Feature Correlations with Final Grade (G3):**")
-        _, target_corr = compute_correlations(filtered_df, "G3")
         target_corr_df = target_corr.to_frame(name="Pearson r").reset_index()
         target_corr_df.columns = ["Variable", "Pearson Correlation (r)"]
         st.dataframe(
@@ -634,50 +711,10 @@ with tab_ml:
             "forecasted solely from pre-enrollment variables (study habits, past failures, attendance, and demographics)."
         )
 
-        # Batch prediction across all active students
+        # Batch prediction across all active students (cached for fast retrieval)
         clean_model = ml_results["clean"]["Random Forest"]["model"]
-        trained_features = list(clean_model.feature_names_in_)
-
-        df_eval = handle_missing_values(filtered_df.copy())
-        drop_eval_cols = [TARGET_COLUMN, "subject"] + [f"label_{c}" for c in LABEL_MAPPINGS.keys()] + GRADE_COLUMNS
-        X_eval_raw = df_eval.drop(columns=[c for c in drop_eval_cols if c in df_eval.columns])
-        for col in BINARY_COLUMNS:
-            if col in X_eval_raw.columns:
-                X_eval_raw[col] = (X_eval_raw[col].astype(str).str.lower() == "yes").astype(int)
-        nom_cols = [c for c in NOMINAL_COLUMNS if c in X_eval_raw.columns]
-        X_eval_encoded = pd.get_dummies(X_eval_raw, columns=nom_cols, drop_first=True, dtype=float)
-        X_eval_aligned = X_eval_encoded.reindex(columns=trained_features, fill_value=0.0)
-
-        all_pred_grades = clean_model.predict(X_eval_aligned)
-        all_pred_grades = np.clip(np.round(all_pred_grades, 2), 0.0, 20.0)
-
-        subject_series = filtered_df["subject"] if "subject" in filtered_df.columns else pd.Series(["Core"] * len(filtered_df))
-
-        predictions_df = pd.DataFrame({
-            "Student ID": [f"STU_{i+1:04d}" for i in range(len(filtered_df))],
-            "Subject": subject_series.values,
-            "School": filtered_df["school"].values,
-            "Gender": [LABEL_MAPPINGS["sex"].get(s, s) for s in filtered_df["sex"].values],
-            "Age": filtered_df["age"].values,
-            "Study Time": filtered_df["studytime"].map(LABEL_MAPPINGS["studytime"]).values,
-            "Failures": filtered_df["failures"].values,
-            "Absences": filtered_df["absences"].values,
-            "Actual G3": filtered_df["G3"].values,
-            "Predicted G3": all_pred_grades,
-            "Error (Actual - Pred)": np.round(filtered_df["G3"].values - all_pred_grades, 2)
-        })
-
-        def _classify_risk_tier(row):
-            pred = row["Predicted G3"]
-            fail = row["Failures"]
-            if pred < 10.0 or fail >= 2:
-                return "🔴 High Academic Risk"
-            elif pred < 11.5 or fail == 1:
-                return "🟡 Moderate Watch"
-            else:
-                return "🟢 On Track / Low Risk"
-
-        predictions_df["Early Warning Tier"] = predictions_df.apply(_classify_risk_tier, axis=1)
+        trained_features = tuple(clean_model.feature_names_in_)
+        predictions_df = get_cached_batch_predictions(active_cache_key, filtered_df, clean_model, trained_features)
 
         high_risk_n = int((predictions_df["Early Warning Tier"] == "🔴 High Academic Risk").sum())
         mod_risk_n  = int((predictions_df["Early Warning Tier"] == "🟡 Moderate Watch").sum())
@@ -799,7 +836,7 @@ with tab_insights:
     st.header("Automated Data-Driven Observations")
     st.write("Dynamic insights calculated mathematically from the active student records.")
 
-    insights_list = generate_automated_insights(filtered_df)
+    insights_list = get_cached_insights(active_cache_key, filtered_df)
 
     for i, ins in enumerate(insights_list, 1):
         with st.expander(f"📌 {ins['category']}: {ins['title']}", expanded=True):
