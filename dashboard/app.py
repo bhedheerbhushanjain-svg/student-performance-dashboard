@@ -104,8 +104,49 @@ def get_cached_dataset(dataset_choice: str) -> pd.DataFrame:
     elif dataset_choice == "Combined Dataset (Both Subjects)":
         return load_both_courses()
     elif dataset_choice == "Matched Cohort (Overlapping Students)":
-        return load_merged_cohort()
+        return _normalise_merged_cohort(load_merged_cohort())
     return load_raw_data("mat")
+
+
+def _normalise_merged_cohort(merged: pd.DataFrame) -> pd.DataFrame:
+    """
+    The Matched Cohort comes from pd.merge() with suffixes ('_mat', '_por').
+    Non-key columns that appear in both subjects get renamed to
+    col_mat / col_por.  This helper collapses the DataFrame back to the
+    standard UCI schema by:
+      1. Renaming every *_mat column -> bare name (Math values used as
+         canonical value for shared behavioural features).
+      2. Dropping the *_por duplicates.
+      3. Keeping all MERGE_KEYS columns (already un-suffixed).
+    The result has exactly the same column set as load_raw_data() so every
+    sidebar filter, chart function, and ML pipeline works without changes.
+    """
+    rename_map = {}
+    drop_cols = []
+    for col in merged.columns:
+        if col.endswith("_mat"):
+            rename_map[col] = col[:-4]   # strip '_mat'
+        elif col.endswith("_por"):
+            drop_cols.append(col)        # drop Portuguese duplicate
+
+    df = merged.drop(columns=drop_cols).rename(columns=rename_map)
+
+    # Add a helper column so users know this is the 382-student overlap cohort
+    df["subject"] = "Matched (Math+Por)"
+    return df
+
+
+@st.cache_data(show_spinner=False)
+def get_cached_ml_results(cache_key: str, _df: pd.DataFrame):
+    """
+    Train ML models once per unique dataset and cache the result.
+    cache_key encodes dataset identity; _df is not hashed by Streamlit
+    (leading underscore convention) — cache_key is used instead.
+    Returns None when there are too few rows for a reliable split.
+    """
+    if len(_df) < 50:
+        return None
+    return compare_leakage_regimes(_df, random_state=42)
 
 
 # ==========================================
@@ -248,6 +289,9 @@ std_g3 = float(g3_col.std()) if len(g3_col) > 1 else 0.0
 pass_rate = float((g3_col >= 10).mean() * 100)
 zero_count = int((g3_col == 0).sum())
 
+# Stable cache key for ML results — shared by Tab 5 and Presentation tab
+ml_cache_key = f"{dataset_choice}|{len(filtered_df)}|{int(filtered_df['G3'].sum())}"
+
 col1, col2, col3, col4, col5 = st.columns(5)
 col1.metric("Total Records", f"{len(filtered_df):,}", f"{(len(filtered_df)/len(raw_df))*100:.1f}% of cohort")
 col2.metric("Mean Final Grade (G3)", f"{mean_g3:.2f} / 20", f"SD: {std_g3:.2f}")
@@ -260,13 +304,14 @@ st.markdown("---")
 # ==========================================
 # DASHBOARD TABS
 # ==========================================
-tab_overview, tab_data, tab_eda, tab_stats, tab_ml, tab_insights = st.tabs([
+tab_overview, tab_data, tab_eda, tab_stats, tab_ml, tab_insights, tab_presentation = st.tabs([
     "🏠 Overview & Architecture",
     "📁 Dataset Explorer",
     "📈 Performance Visualizations",
     "🧮 Statistical Deep-Dive",
     "🔬 ML & Data Leakage Lab",
-    "💡 Automated Insights"
+    "💡 Automated Insights",
+    "📊 Presentation"
 ])
 
 # ------------------------------------------
@@ -477,7 +522,7 @@ with tab_ml:
         st.warning("⚠️ Insufficient samples for reliable train/test machine learning split. Please broaden active filters.")
     else:
         with st.spinner("Training Linear Regression and Random Forest Regressors..."):
-            ml_results = compare_leakage_regimes(filtered_df, random_state=42)
+            ml_results = get_cached_ml_results(ml_cache_key, filtered_df)
 
         st.subheader("Empirical Model Performance Comparison")
         st.dataframe(
@@ -596,6 +641,704 @@ with tab_insights:
     They should not be construed as immutable causal mechanisms. Educational performance is multifaceted,
     and institutional interventions should encompass qualitative, socio-economic, and psychological support.
     """)
+
+
+# ------------------------------------------
+# TAB 7: PRESENTATION
+# ------------------------------------------
+with tab_presentation:
+    # ── Compute all live metrics from the currently filtered dataset ──
+    total_students = len(filtered_df)
+    raw_total = len(raw_df)
+    avg_g3    = float(filtered_df["G3"].mean())
+    pass_pct  = float((filtered_df["G3"] >= 10).mean() * 100)
+    fail_cnt  = int((filtered_df["G3"] == 0).sum())
+    std_g3_p  = float(filtered_df["G3"].std())
+
+    female_cnt = int((filtered_df["sex"] == "F").sum())
+    male_cnt   = int((filtered_df["sex"] == "M").sum())
+    female_pct = female_cnt / total_students * 100
+    male_pct   = male_cnt   / total_students * 100
+    f_avg = float(filtered_df[filtered_df["sex"] == "F"]["G3"].mean())
+    m_avg = float(filtered_df[filtered_df["sex"] == "M"]["G3"].mean())
+
+    urban_cnt = int((filtered_df["address"] == "U").sum())
+    rural_cnt = int((filtered_df["address"] == "R").sum())
+    urban_pct = urban_cnt / total_students * 100
+    u_avg = float(filtered_df[filtered_df["address"] == "U"]["G3"].mean())
+    r_avg = float(filtered_df[filtered_df["address"] == "R"]["G3"].mean())
+
+    inet_yes = int((filtered_df["internet"] == "yes").sum())
+    inet_pct = inet_yes / total_students * 100
+    inet_avg = float(filtered_df[filtered_df["internet"] == "yes"]["G3"].mean())
+    no_inet_avg = float(filtered_df[filtered_df["internet"] == "no"]["G3"].mean())
+
+    # Study time averages
+    st_avgs = {k: round(filtered_df[filtered_df["studytime"] == k]["G3"].mean(), 2)
+               for k in sorted(filtered_df["studytime"].unique())}
+    st_counts = filtered_df["studytime"].value_counts().sort_index().to_dict()
+
+    # Failures averages
+    fail_avgs = {k: round(filtered_df[filtered_df["failures"] == k]["G3"].mean(), 2)
+                 for k in sorted(filtered_df["failures"].unique())}
+    fail_counts = filtered_df["failures"].value_counts().sort_index().to_dict()
+
+    # Correlations
+    num_cols_p = filtered_df.select_dtypes(include="number").columns
+    corr_g3 = filtered_df[num_cols_p].corr()["G3"].drop("G3").abs().sort_values(ascending=False)
+
+    # Grade buckets
+    bins_p  = [0, 9, 11, 13, 15, 20]
+    lbls_p  = ["Fail (0\u20139)", "Pass (10\u201311)", "Average (12\u201313)", "Good (14\u201315)", "Excellent (16\u201320)"]
+    buckets = pd.cut(filtered_df["G3"], bins=bins_p, labels=lbls_p, include_lowest=True).value_counts()
+
+    # Romantic
+    rom_yes_avg = float(filtered_df[filtered_df["romantic"] == "yes"]["G3"].mean()) if "romantic" in filtered_df else 0.0
+    rom_no_avg  = float(filtered_df[filtered_df["romantic"] == "no"]["G3"].mean())  if "romantic" in filtered_df else 0.0
+
+    study_labels_map = {1: "<2 hrs", 2: "2–5 hrs", 3: "5–10 hrs", 4: ">10 hrs"}
+    fail_labels_map  = {0: "0 failures", 1: "1 failure", 2: "2 failures", 3: "3 failures"}
+
+    # ── Slide navigation ──
+    SLIDES = [
+        "1 · Title",
+        "2 · Project Overview",
+        "3 · The Dataset",
+        "4 · Student Demographics",
+        "5 · Grade Analysis",
+        "6 · What Affects Grades?",
+        "7 · Study Time Impact",
+        "8 · Failures & Absences",
+        "9 · Social Insights",
+        "10 · ML Results",
+        "11 · Open-Source Workflow",
+        "12 · Summary",
+    ]
+
+    SLIDE_CSS = """
+    <style>
+    .slide-box {
+        background: linear-gradient(135deg, #0d1b2a 0%, #1a2f45 100%);
+        border-radius: 16px;
+        padding: 40px 48px;
+        color: #ffffff;
+        min-height: 420px;
+        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    }
+    .slide-title {
+        font-size: 2.0rem;
+        font-weight: 800;
+        color: #00c9a7;
+        margin-bottom: 8px;
+        letter-spacing: -0.5px;
+    }
+    .slide-subtitle {
+        font-size: 1.1rem;
+        color: #90caf9;
+        margin-bottom: 24px;
+    }
+    .slide-body { font-size: 1.0rem; line-height: 1.7; }
+    .stat-card {
+        background: #1e3a5f;
+        border-left: 4px solid #00c9a7;
+        border-radius: 8px;
+        padding: 10px 16px;
+        margin: 6px 0;
+    }
+    .stat-number { font-size: 1.6rem; font-weight: 700; color: #ffd166; }
+    .stat-label  { font-size: 0.85rem; color: #90caf9; }
+    .insight-box {
+        background: #0a3d2e;
+        border: 1px solid #00c9a7;
+        border-radius: 8px;
+        padding: 12px 18px;
+        margin-top: 16px;
+        font-style: italic;
+        color: #b2dfdb;
+    }
+    .slide-number {
+        font-size: 0.75rem;
+        color: #546e7a;
+        text-align: right;
+        margin-top: 24px;
+    }
+    </style>
+    """
+    st.markdown(SLIDE_CSS, unsafe_allow_html=True)
+
+    col_nav_prev, col_nav_select, col_nav_next = st.columns([1, 6, 1])
+    with col_nav_select:
+        slide_choice = st.select_slider(
+            "Navigate Slides",
+            options=SLIDES,
+            label_visibility="collapsed"
+        )
+    slide_idx = SLIDES.index(slide_choice) + 1
+
+    with col_nav_prev:
+        if st.button("◀ Prev", use_container_width=True) and slide_idx > 1:
+            slide_choice = SLIDES[slide_idx - 2]
+            slide_idx -= 1
+    with col_nav_next:
+        if st.button("Next ▶", use_container_width=True) and slide_idx < len(SLIDES):
+            slide_choice = SLIDES[slide_idx]
+            slide_idx += 1
+
+    st.markdown(f"**Slide {slide_idx} of {len(SLIDES)}** — *{slide_choice}*")
+    st.markdown("---")
+
+    # ── SLIDE 1: TITLE ──
+    if slide_idx == 1:
+        st.markdown(f"""
+        <div class="slide-box">
+            <div style="text-align:center; padding: 20px 0;">
+                <div style="font-size:3.5rem;">🎓</div>
+                <div class="slide-title" style="font-size:2.4rem; text-align:center;">
+                    Student Performance Analysis Dashboard
+                </div>
+                <div class="slide-subtitle" style="text-align:center;">
+                    Open Source Technologies (OST) Academic Project
+                </div>
+                <hr style="border-color:#1e3a5f; margin: 20px auto; width: 60%;">
+                <div style="color:#cfd8dc; font-size:1.05rem;">
+                    <b>Bhedheer Bhushan Jain</b> &nbsp;|&nbsp; PRN: 25030422033
+                </div>
+                <div style="margin-top:16px;">
+                    <span style="background:#1e3a5f; color:#00c9a7; padding:4px 12px; border-radius:20px; font-size:0.85rem; margin:4px;">Python</span>
+                    <span style="background:#1e3a5f; color:#00c9a7; padding:4px 12px; border-radius:20px; font-size:0.85rem; margin:4px;">Streamlit</span>
+                    <span style="background:#1e3a5f; color:#00c9a7; padding:4px 12px; border-radius:20px; font-size:0.85rem; margin:4px;">Git & GitHub</span>
+                    <span style="background:#1e3a5f; color:#00c9a7; padding:4px 12px; border-radius:20px; font-size:0.85rem; margin:4px;">Machine Learning</span>
+                    <span style="background:#1e3a5f; color:#00c9a7; padding:4px 12px; border-radius:20px; font-size:0.85rem; margin:4px;">Docker</span>
+                    <span style="background:#1e3a5f; color:#00c9a7; padding:4px 12px; border-radius:20px; font-size:0.85rem; margin:4px;">CI/CD</span>
+                </div>
+                <div style="margin-top:24px; color:#546e7a; font-size:0.8rem;">
+                    🔗 github.com/bhedheerbhushanjain-svg/student-performance-dashboard
+                </div>
+            </div>
+            <div class="slide-number">Slide 1 / {len(SLIDES)}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # ── SLIDE 2: PROJECT OVERVIEW ──
+    elif slide_idx == 2:
+        st.markdown(f"""
+        <div class="slide-box">
+            <div class="slide-title">What Did We Build?</div>
+            <div class="slide-subtitle">A complete open-source data analysis system for student performance</div>
+            <div class="slide-body">
+            <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:16px; margin-top:8px;">
+                <div class="stat-card">
+                    <div style="font-size:1.5rem;">📊</div>
+                    <b style="color:#00c9a7;">Data Analysis</b><br>
+                    UCI Student Performance Dataset &mdash; <b>{raw_total:,}</b> real student records from Portuguese schools
+                </div>
+                <div class="stat-card">
+                    <div style="font-size:1.5rem;">🐍</div>
+                    <b style="color:#00c9a7;">Python Pipeline</b><br>
+                    pandas, NumPy, Plotly, scikit-learn &mdash; full modular src/ architecture with 21 automated tests
+                </div>
+                <div class="stat-card">
+                    <div style="font-size:1.5rem;">🌐</div>
+                    <b style="color:#00c9a7;">Live Dashboard</b><br>
+                    Streamlit web app with 7 interactive tabs, sidebar filters, ML predictor & insights engine
+                </div>
+            </div>
+            <div class="insight-box">
+                💡 This project demonstrates the complete open-source development lifecycle: Git branching,
+                GitHub CI/CD, MIT licensing, issue templates, Docker containerisation, and reproducible research.
+            </div>
+            </div>
+            <div class="slide-number">Slide 2 / {len(SLIDES)}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # ── SLIDE 3: DATASET ──
+    elif slide_idx == 3:
+        st.markdown(f"""
+        <div class="slide-box">
+            <div class="slide-title">About the Data</div>
+            <div class="slide-subtitle">UCI Machine Learning Repository — Cortez & Silva, 2008 (CC BY 4.0)</div>
+            <div class="slide-body" style="display:grid; grid-template-columns:1fr 1fr; gap:24px;">
+                <div>
+                    <b style="color:#00c9a7;">Dataset at a Glance</b>
+                    <div class="stat-card" style="margin-top:12px;">
+                        <span class="stat-number">{raw_total:,}</span>
+                        <span class="stat-label"> total student records</span>
+                    </div>
+                    <div class="stat-card">
+                        <span class="stat-number">33</span>
+                        <span class="stat-label"> features per student</span>
+                    </div>
+                    <div class="stat-card">
+                        <span class="stat-number">2</span>
+                        <span class="stat-label"> subjects: Mathematics + Portuguese</span>
+                    </div>
+                    <div class="stat-card">
+                        <span class="stat-number">G3</span>
+                        <span class="stat-label"> is the target — Final Grade (0–20 scale)</span>
+                    </div>
+                </div>
+                <div>
+                    <b style="color:#00c9a7;">Features Include</b>
+                    <ul style="margin-top:12px; color:#cfd8dc; line-height:2.0;">
+                        <li>Age, sex, home address (Urban / Rural)</li>
+                        <li>Parents&apos; education &amp; job type</li>
+                        <li>Weekly study time &amp; free time</li>
+                        <li>Number of past class failures</li>
+                        <li>School &amp; family support received</li>
+                        <li>Internet access at home</li>
+                        <li>Health status &amp; school absences</li>
+                        <li>Term grades: G1 &rarr; G2 &rarr; G3 (Final)</li>
+                    </ul>
+                </div>
+            </div>
+            <div class="slide-number">Slide 3 / {len(SLIDES)}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # ── SLIDE 4: DEMOGRAPHICS ──
+    elif slide_idx == 4:
+        age_dist = filtered_df["age"].value_counts().sort_index()
+        age_rows = " ".join([
+            f"<td style='padding:4px 10px; text-align:center;'>{a}</td><td style='padding:4px 10px; text-align:center; color:#ffd166;'>{c}</td>"
+            for a, c in age_dist.items()
+        ])
+        st.markdown(f"""
+        <div class="slide-box">
+            <div class="slide-title">Who Are the Students?</div>
+            <div class="slide-subtitle">Demographics from {total_students:,} currently filtered records</div>
+            <div style="display:grid; grid-template-columns:1fr 1fr 1fr 1fr; gap:14px; margin-bottom:20px;">
+                <div class="stat-card" style="text-align:center;">
+                    <div class="stat-number">{female_cnt}</div>
+                    <div class="stat-label">👩 Female ({female_pct:.1f}%) — avg {f_avg:.2f}</div>
+                </div>
+                <div class="stat-card" style="text-align:center;">
+                    <div class="stat-number">{male_cnt}</div>
+                    <div class="stat-label">👦 Male ({male_pct:.1f}%) — avg {m_avg:.2f}</div>
+                </div>
+                <div class="stat-card" style="text-align:center;">
+                    <div class="stat-number">{urban_cnt}</div>
+                    <div class="stat-label">🏙️ Urban ({urban_pct:.1f}%) — avg {u_avg:.2f}</div>
+                </div>
+                <div class="stat-card" style="text-align:center;">
+                    <div class="stat-number">{rural_cnt}</div>
+                    <div class="stat-label">🌾 Rural ({100-urban_pct:.1f}%) — avg {r_avg:.2f}</div>
+                </div>
+            </div>
+            <b style="color:#00c9a7;">Age Distribution</b>
+            <table style="margin-top:10px; border-collapse:collapse; width:100%; color:#cfd8dc;">
+                <tr style="color:#90caf9;">
+                    {"".join([f"<th style='padding:4px 10px;'>Age {a}</th>" for a in age_dist.index])}
+                </tr>
+                <tr>{age_rows}</tr>
+            </table>
+            <div class="insight-box">
+                🌐 Internet at home: <b>{inet_yes} students ({inet_pct:.1f}%)</b> —
+                students with internet average <b>{inet_avg:.2f}</b> vs <b>{no_inet_avg:.2f}</b> without
+                (+{inet_avg - no_inet_avg:.2f} grade points advantage)
+            </div>
+            <div class="slide-number">Slide 4 / {len(SLIDES)}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # ── SLIDE 5: GRADE ANALYSIS ──
+    elif slide_idx == 5:
+        bucket_rows = ""
+        colors = {"Fail (0–9)": "#ef5350", "Pass (10–11)": "#ffd166",
+                  "Average (12–13)": "#42a5f5", "Good (14–15)": "#66bb6a", "Excellent (16–20)": "#00c9a7"}
+        for lbl in lbls_p:
+            cnt = int(buckets.get(lbl, 0))
+            pct = cnt / total_students * 100
+            color = colors.get(lbl, "#ffffff")
+            bar_w = int(pct * 3)
+            bucket_rows += f"""
+            <tr>
+                <td style="padding:5px 12px; color:{color};">{lbl}</td>
+                <td style="padding:5px 12px; color:#ffd166; font-weight:700;">{cnt}</td>
+                <td style="padding:5px 12px;">{pct:.1f}%</td>
+                <td style="padding:5px 12px;">
+                    <div style="background:{color}; height:14px; width:{bar_w}px; border-radius:4px;"></div>
+                </td>
+            </tr>"""
+        st.markdown(f"""
+        <div class="slide-box">
+            <div class="slide-title">How Did Students Perform?</div>
+            <div class="slide-subtitle">Final Grade (G3) distribution across {total_students:,} students</div>
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:24px;">
+                <div>
+                    <table style="border-collapse:collapse; color:#cfd8dc; width:100%;">
+                        <tr style="color:#90caf9; border-bottom:1px solid #1e3a5f;">
+                            <th style="padding:5px 12px; text-align:left;">Range</th>
+                            <th style="padding:5px 12px;">Count</th>
+                            <th style="padding:5px 12px;">%</th>
+                            <th style="padding:5px 12px; text-align:left;">Bar</th>
+                        </tr>
+                        {bucket_rows}
+                    </table>
+                </div>
+                <div>
+                    <div class="stat-card" style="text-align:center; margin-bottom:12px;">
+                        <span class="stat-number">{avg_g3:.2f} / 20</span>
+                        <div class="stat-label">Overall Average Final Grade</div>
+                    </div>
+                    <div class="stat-card" style="text-align:center; margin-bottom:12px;">
+                        <span class="stat-number">{pass_pct:.1f}%</span>
+                        <div class="stat-label">Overall Pass Rate (G3 ≥ 10)</div>
+                    </div>
+                    <div class="stat-card" style="text-align:center;">
+                        <span class="stat-number">{std_g3_p:.2f}</span>
+                        <div class="stat-label">Standard Deviation of G3</div>
+                    </div>
+                </div>
+            </div>
+            <div class="slide-number">Slide 5 / {len(SLIDES)}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # ── SLIDE 6: CORRELATIONS ──
+    elif slide_idx == 6:
+        top10 = corr_g3.head(10)
+        corr_rows = ""
+        for feat, val in top10.items():
+            bar_w = int(val * 280)
+            color = "#ef5350" if val > 0.5 else "#ffd166" if val > 0.2 else "#66bb6a"
+            corr_rows += f"""
+            <tr>
+                <td style="padding:4px 10px; color:#cfd8dc;">{feat}</td>
+                <td style="padding:4px 10px; color:#ffd166; font-weight:700;">{val:.3f}</td>
+                <td style="padding:4px 10px;">
+                    <div style="background:{color}; height:12px; width:{bar_w}px; border-radius:4px;"></div>
+                </td>
+            </tr>"""
+        st.markdown(f"""
+        <div class="slide-box">
+            <div class="slide-title">What Affects Final Grades?</div>
+            <div class="slide-subtitle">Absolute Pearson correlation with G3 — calculated from active {total_students:,} students</div>
+            <table style="border-collapse:collapse; width:100%; margin-top:8px;">
+                <tr style="color:#90caf9; border-bottom:1px solid #1e3a5f;">
+                    <th style="padding:4px 10px; text-align:left;">Feature</th>
+                    <th style="padding:4px 10px;">|r|</th>
+                    <th style="padding:4px 10px; text-align:left;">Strength</th>
+                </tr>
+                {corr_rows}
+            </table>
+            <div class="insight-box">
+                💡 G1 and G2 (prior term grades) dominate due to temporal collinearity.
+                For genuine early-warning prediction, study time and failures are the strongest
+                actionable signals available <i>before</i> the school year begins.
+            </div>
+            <div class="slide-number">Slide 6 / {len(SLIDES)}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # ── SLIDE 7: STUDY TIME ──
+    elif slide_idx == 7:
+        study_rows = ""
+        for k in sorted(st_avgs.keys()):
+            lbl = study_labels_map.get(k, str(k))
+            cnt = st_counts.get(k, 0)
+            avg = st_avgs[k]
+            bar_w = int((avg / 20) * 240)
+            study_rows += f"""
+            <tr>
+                <td style="padding:6px 12px; color:#90caf9;">{lbl}</td>
+                <td style="padding:6px 12px; color:#cfd8dc;">{cnt} students</td>
+                <td style="padding:6px 12px; color:#ffd166; font-weight:700;">{avg}</td>
+                <td style="padding:6px 12px;">
+                    <div style="background:#00c9a7; height:14px; width:{bar_w}px; border-radius:4px;"></div>
+                </td>
+            </tr>"""
+        min_k = min(st_avgs.keys())
+        max_k = max(st_avgs.keys())
+        diff  = round(st_avgs[max_k] - st_avgs[min_k], 2)
+        st.markdown(f"""
+        <div class="slide-box">
+            <div class="slide-title">Does More Study = Better Grades?</div>
+            <div class="slide-subtitle">Weekly study time vs average final grade — {total_students:,} students</div>
+            <table style="border-collapse:collapse; width:100%; margin-top:8px;">
+                <tr style="color:#90caf9; border-bottom:1px solid #1e3a5f;">
+                    <th style="padding:6px 12px; text-align:left;">Study Time / Week</th>
+                    <th style="padding:6px 12px;">Students</th>
+                    <th style="padding:6px 12px;">Avg G3</th>
+                    <th style="padding:6px 12px; text-align:left;">Visual</th>
+                </tr>
+                {study_rows}
+            </table>
+            <div class="insight-box">
+                📈 Students in the highest study-time bracket score on average
+                <b>+{diff} grade points</b> more than the lowest bracket —
+                an improvement of <b>{diff/st_avgs[min_k]*100:.1f}%</b>.
+            </div>
+            <div class="slide-number">Slide 7 / {len(SLIDES)}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # ── SLIDE 8: FAILURES & ABSENCES ──
+    elif slide_idx == 8:
+        fail_rows = ""
+        for k in sorted(fail_avgs.keys()):
+            lbl = fail_labels_map.get(k, f"{k} failures")
+            cnt = fail_counts.get(k, 0)
+            avg = fail_avgs[k]
+            pct_cnt = cnt / total_students * 100
+            color = "#ef5350" if k > 0 else "#66bb6a"
+            fail_rows += f"""
+            <tr>
+                <td style="padding:6px 12px; color:{color};">{lbl}</td>
+                <td style="padding:6px 12px; color:#cfd8dc;">{cnt} ({pct_cnt:.1f}%)</td>
+                <td style="padding:6px 12px; color:#ffd166; font-weight:700;">{avg}</td>
+            </tr>"""
+        avg_abs = round(float(filtered_df["absences"].mean()), 2)
+        max_abs = int(filtered_df["absences"].max())
+        zero_abs = int((filtered_df["absences"] == 0).sum())
+        drop_val = round(fail_avgs.get(0, 0) - fail_avgs.get(1, 0), 2) if 1 in fail_avgs else 0
+        st.markdown(f"""
+        <div class="slide-box">
+            <div class="slide-title">The Cost of Failures & Absences</div>
+            <div class="slide-subtitle">Past failures and attendance — computed from {total_students:,} students</div>
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:24px;">
+                <div>
+                    <b style="color:#00c9a7;">Past Class Failures → Final Grade</b>
+                    <table style="border-collapse:collapse; width:100%; margin-top:10px;">
+                        <tr style="color:#90caf9; border-bottom:1px solid #1e3a5f;">
+                            <th style="padding:6px 12px; text-align:left;">Failures</th>
+                            <th style="padding:6px 12px;">Students</th>
+                            <th style="padding:6px 12px;">Avg G3</th>
+                        </tr>
+                        {fail_rows}
+                    </table>
+                    <div style="margin-top:12px; color:#ef9a9a; font-size:0.9rem;">
+                        ⚠️ Even 1 past failure drops average grade by <b>{drop_val} points</b>
+                    </div>
+                </div>
+                <div>
+                    <b style="color:#00c9a7;">School Absences</b>
+                    <div class="stat-card" style="text-align:center; margin:12px 0;">
+                        <span class="stat-number">{avg_abs}</span>
+                        <div class="stat-label">Average absences per student</div>
+                    </div>
+                    <div class="stat-card" style="text-align:center; margin-bottom:12px;">
+                        <span class="stat-number">{max_abs}</span>
+                        <div class="stat-label">Maximum absences recorded</div>
+                    </div>
+                    <div class="stat-card" style="text-align:center;">
+                        <span class="stat-number">{zero_abs}</span>
+                        <div class="stat-label">Students with zero absences ({zero_abs/total_students*100:.1f}%)</div>
+                    </div>
+                </div>
+            </div>
+            <div class="slide-number">Slide 8 / {len(SLIDES)}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # ── SLIDE 9: SOCIAL INSIGHTS ──
+    elif slide_idx == 9:
+        rom_yes_cnt = int((filtered_df["romantic"] == "yes").sum()) if "romantic" in filtered_df.columns else 0
+        rom_no_cnt  = int((filtered_df["romantic"] == "no").sum())  if "romantic" in filtered_df.columns else 0
+        rom_diff    = round(rom_no_avg - rom_yes_avg, 2)
+        inet_diff   = round(inet_avg - no_inet_avg, 2)
+        addr_diff   = round(u_avg - r_avg, 2)
+        st.markdown(f"""
+        <div class="slide-box">
+            <div class="slide-title">Surprising Social Insights</div>
+            <div class="slide-subtitle">Lifestyle factors and their measurable impact on grades — {total_students:,} students</div>
+            <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:16px; margin-top:16px;">
+                <div class="stat-card">
+                    <div style="font-size:1.8rem; text-align:center;">💑</div>
+                    <b style="color:#00c9a7;">Romantic Relationships</b>
+                    <ul style="margin-top:10px; color:#cfd8dc; line-height:2.0; padding-left:16px;">
+                        <li>In a relationship: <b>{rom_yes_cnt}</b> students</li>
+                        <li>Avg grade: <b style="color:#ffd166;">{rom_yes_avg:.2f}</b></li>
+                        <li>Not in one: <b>{rom_no_cnt}</b> students</li>
+                        <li>Avg grade: <b style="color:#ffd166;">{rom_no_avg:.2f}</b></li>
+                    </ul>
+                    <div style="color:#ef9a9a; margin-top:8px;">
+                        &minus;{rom_diff:.2f} pts for those in relationships
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div style="font-size:1.8rem; text-align:center;">🌐</div>
+                    <b style="color:#00c9a7;">Internet Access</b>
+                    <ul style="margin-top:10px; color:#cfd8dc; line-height:2.0; padding-left:16px;">
+                        <li>With internet: <b>{inet_yes}</b> ({inet_pct:.1f}%)</li>
+                        <li>Avg grade: <b style="color:#ffd166;">{inet_avg:.2f}</b></li>
+                        <li>Without internet: <b>{total_students - inet_yes}</b></li>
+                        <li>Avg grade: <b style="color:#ffd166;">{no_inet_avg:.2f}</b></li>
+                    </ul>
+                    <div style="color:#66bb6a; margin-top:8px;">
+                        +{inet_diff:.2f} pts advantage with internet
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div style="font-size:1.8rem; text-align:center;">🏠</div>
+                    <b style="color:#00c9a7;">Urban vs Rural</b>
+                    <ul style="margin-top:10px; color:#cfd8dc; line-height:2.0; padding-left:16px;">
+                        <li>Urban: <b>{urban_cnt}</b> ({urban_pct:.1f}%)</li>
+                        <li>Avg grade: <b style="color:#ffd166;">{u_avg:.2f}</b></li>
+                        <li>Rural: <b>{rural_cnt}</b> ({100-urban_pct:.1f}%)</li>
+                        <li>Avg grade: <b style="color:#ffd166;">{r_avg:.2f}</b></li>
+                    </ul>
+                    <div style="color:#66bb6a; margin-top:8px;">
+                        +{addr_diff:.2f} pts advantage for urban students
+                    </div>
+                </div>
+            </div>
+            <div class="insight-box">
+                🔍 Socioeconomic access gaps (internet, location) create measurable academic disadvantages.
+                These are systemic factors, not individual choices.
+            </div>
+            <div class="slide-number">Slide 9 / {len(SLIDES)}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # ── SLIDE 10: ML RESULTS ──
+    elif slide_idx == 10:
+        ml_note = ""
+        if total_students >= 50:
+            try:
+                ml_res_p = get_cached_ml_results(ml_cache_key, filtered_df)
+                tbl = ml_res_p["table"]
+                rf_leak_r2  = float(tbl.loc[(tbl["Regime"]=="Leaky") & (tbl["Model"]=="Random Forest"), "R2"].values[0])
+                lr_leak_r2  = float(tbl.loc[(tbl["Regime"]=="Leaky") & (tbl["Model"]=="Linear Regression"), "R2"].values[0])
+                rf_clean_r2 = float(tbl.loc[(tbl["Regime"]=="Clean") & (tbl["Model"]=="Random Forest"), "R2"].values[0])
+                lr_clean_r2 = float(tbl.loc[(tbl["Regime"]=="Clean") & (tbl["Model"]=="Linear Regression"), "R2"].values[0])
+                ml_note = f"""
+                <div style="display:grid; grid-template-columns:1fr 1fr; gap:24px; margin-top:16px;">
+                    <div>
+                        <b style="color:#ef9a9a;">⚠️ Regime A — With G1 &amp; G2 (Data Leakage)</b>
+                        <div class="stat-card" style="margin-top:10px;">
+                            <div>🌳 Random Forest R²: <span class="stat-number">{rf_leak_r2:.4f}</span></div>
+                        </div>
+                        <div class="stat-card">
+                            <div>📉 Linear Regression R²: <span class="stat-number">{lr_leak_r2:.4f}</span></div>
+                        </div>
+                        <div style="color:#ef9a9a; font-size:0.85rem; margin-top:8px;">
+                            High accuracy — but G2≈G3 creates temporal leakage
+                        </div>
+                    </div>
+                    <div>
+                        <b style="color:#66bb6a;">✅ Regime B — Without G1 &amp; G2 (Honest Early-Warning)</b>
+                        <div class="stat-card" style="margin-top:10px;">
+                            <div>🌳 Random Forest R²: <span class="stat-number">{rf_clean_r2:.4f}</span></div>
+                        </div>
+                        <div class="stat-card">
+                            <div>📉 Linear Regression R²: <span class="stat-number">{lr_clean_r2:.4f}</span></div>
+                        </div>
+                        <div style="color:#66bb6a; font-size:0.85rem; margin-top:8px;">
+                            Genuine model using only background factors
+                        </div>
+                    </div>
+                </div>"""
+            except Exception:
+                ml_note = "<div class='insight-box'>⚠️ ML results unavailable for current filter selection.</div>"
+        else:
+            ml_note = "<div class='insight-box'>⚠️ Too few records for ML training. Broaden filters to see live results.</div>"
+
+        st.markdown(f"""
+        <div class="slide-box">
+            <div class="slide-title">Can We Predict Student Grades?</div>
+            <div class="slide-subtitle">Two ML regimes — with and without data leakage — trained on {total_students:,} students</div>
+            {ml_note}
+            <div class="insight-box" style="margin-top:16px;">
+                🎯 Key Takeaway: Early intervention models (Regime B) are weaker but more honest and deployable.
+                Study habits, failures, and background are the real actionable signals.
+            </div>
+            <div class="slide-number">Slide 10 / {len(SLIDES)}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # ── SLIDE 11: OPEN-SOURCE WORKFLOW ──
+    elif slide_idx == 11:
+        st.markdown(f"""
+        <div class="slide-box">
+            <div class="slide-title">Complete Open-Source Development Lifecycle</div>
+            <div class="slide-subtitle">Every OST concept demonstrated end-to-end</div>
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:20px; margin-top:12px;">
+                <div>
+                    <b style="color:#00c9a7;">Git &amp; GitHub</b>
+                    <ul style="color:#cfd8dc; line-height:2.0; padding-left:16px;">
+                        <li>8 branches: <code>main</code>, <code>develop</code>, <code>feature/*</code>, <code>docs/*</code></li>
+                        <li>Conventional commits on every branch</li>
+                        <li>Pull Request merges into main</li>
+                        <li>GitHub Actions CI/CD — all tests passing ✅</li>
+                        <li>Multi-OS (Ubuntu + Windows) × Python 3.10/3.11/3.12</li>
+                    </ul>
+                    <b style="color:#00c9a7;">Documentation</b>
+                    <ul style="color:#cfd8dc; line-height:2.0; padding-left:16px;">
+                        <li>README.md, CHANGELOG.md, SECURITY.md</li>
+                        <li>CODE_OF_CONDUCT.md, CONTRIBUTING.md</li>
+                        <li>Issue &amp; PR templates in .github/</li>
+                        <li>docs/: dataset, methodology, architecture, linux-commands</li>
+                    </ul>
+                </div>
+                <div>
+                    <b style="color:#00c9a7;">Code Quality</b>
+                    <ul style="color:#cfd8dc; line-height:2.0; padding-left:16px;">
+                        <li>21 automated pytest tests</li>
+                        <li>Modular src/ architecture</li>
+                        <li>MIT Open-Source License</li>
+                        <li>requirements.txt with pinned versions</li>
+                    </ul>
+                    <b style="color:#00c9a7;">Containerisation</b>
+                    <ul style="color:#cfd8dc; line-height:2.0; padding-left:16px;">
+                        <li>Dockerfile (python:3.11-slim, non-root)</li>
+                        <li>docker-compose.yml</li>
+                        <li>Makefile for one-command dev workflow</li>
+                    </ul>
+                </div>
+            </div>
+            <div class="slide-number">Slide 11 / {len(SLIDES)}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # ── SLIDE 12: SUMMARY ──
+    elif slide_idx == 12:
+        st.markdown(f"""
+        <div class="slide-box">
+            <div style="text-align:center;">
+                <div class="slide-title" style="text-align:center;">Project Summary</div>
+                <div class="slide-subtitle" style="text-align:center;">
+                    What we built, what we proved, and what we learned
+                </div>
+            </div>
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:24px; margin-top:16px;">
+                <div>
+                    <b style="color:#00c9a7;">Deliverables</b>
+                    <ul style="color:#cfd8dc; line-height:2.2; padding-left:16px; margin-top:8px;">
+                        <li>✅ {raw_total:,} real students analysed</li>
+                        <li>✅ 12 interactive Plotly visualisations</li>
+                        <li>✅ 2 ML models (RF + Linear Regression)</li>
+                        <li>✅ 21 automated tests — all passing</li>
+                        <li>✅ 8 Git branches with full commit history</li>
+                        <li>✅ GitHub Actions CI (3 OS × 3 Python versions)</li>
+                        <li>✅ Streamlit live dashboard — 7 interactive tabs</li>
+                    </ul>
+                </div>
+                <div>
+                    <b style="color:#00c9a7;">OST Concepts Covered</b>
+                    <ul style="color:#cfd8dc; line-height:2.2; padding-left:16px; margin-top:8px;">
+                        <li>✅ Git, GitHub, Branching, Pull Requests</li>
+                        <li>✅ Open-Source License (MIT)</li>
+                        <li>✅ Issue Templates &amp; PR Templates</li>
+                        <li>✅ Code of Conduct &amp; Contributing Guide</li>
+                        <li>✅ Docker / Containerisation</li>
+                        <li>✅ Automated Testing &amp; CI/CD</li>
+                        <li>✅ Data Analysis &amp; ML in Python</li>
+                    </ul>
+                </div>
+            </div>
+            <div style="text-align:center; margin-top:24px; color:#546e7a; font-size:0.9rem;">
+                🔗 github.com/bhedheerbhushanjain-svg/student-performance-dashboard
+            </div>
+            <div style="text-align:center; margin-top:12px; font-size:1.2rem; color:#00c9a7; font-weight:700;">
+                ✨ Thank You — Bhedheer Bhushan Jain | PRN: 25030422033
+            </div>
+            <div class="slide-number">Slide 12 / {len(SLIDES)}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("---")
+    st.caption(f"📊 Presentation data is live — computed from **{total_students:,}** currently filtered student records. Use sidebar to change cohort or filters.")
 
 # Footer
 st.markdown("---")
